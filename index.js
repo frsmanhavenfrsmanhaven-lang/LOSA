@@ -1,0 +1,3145 @@
+
+'use strict';
+
+require('dotenv').config();
+
+const fs = require('node:fs');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const http = require('node:http');
+
+const {
+  Client,
+  GatewayIntentBits,
+  Events,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  ChannelType,
+  ContainerBuilder,
+  TextDisplayBuilder,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  LabelBuilder,
+  MessageFlags
+} = require('discord.js');
+
+const ENV = process.env;
+
+for (const key of ['DISCORD_TOKEN', 'CLIENT_ID', 'GUILD_ID']) {
+  if (!ENV[key]) {
+    throw new Error(`Missing ${key} in .env`);
+  }
+}
+
+const API_BASE = (
+  ENV.ERLC_BASE_URL || 'https://api.erlc.gg/v1'
+).replace(/\/+$/, '');
+
+const POLL_INTERVAL = Math.max(
+  30000,
+  Number(ENV.POLL_INTERVAL_MS) || 60000
+);
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent
+  ]
+});
+
+// =============================================
+// DATABASE
+// =============================================
+
+const DATA_PATH = path.join(
+  ENV.DATA_DIR || __dirname,
+  'data.json'
+);
+
+fs.mkdirSync(path.dirname(DATA_PATH), {
+  recursive: true
+});
+
+const RESPONSES_PATH = path.join(
+  __dirname,
+  'responses.json'
+);
+
+function defaults() {
+  return {
+    linkedUsers: {},
+    pendingLinks: {},
+    tickets: {},
+    dmSupport: {},
+
+    session: {
+      active: false,
+      startedAt: null,
+      hostId: null,
+      messageId: null,
+      channelId: null,
+      infoMessageId: null
+    },
+
+    vote: null
+  };
+}
+
+let db = defaults();
+
+if (fs.existsSync(DATA_PATH)) {
+  const stored = JSON.parse(
+    fs.readFileSync(DATA_PATH, 'utf8')
+  );
+
+  db = {
+    ...defaults(),
+    ...stored,
+    linkedUsers: stored.linkedUsers || {},
+    pendingLinks: stored.pendingLinks || {},
+    tickets: stored.tickets || {},
+    dmSupport: stored.dmSupport || {},
+
+    session: {
+      ...defaults().session,
+      ...(stored.session || {})
+    }
+  };
+}
+
+let saveQueue = Promise.resolve();
+
+function save() {
+  const content = JSON.stringify(db, null, 2);
+
+  saveQueue = saveQueue
+    .catch(() => {})
+    .then(async () => {
+      const temporary = DATA_PATH + '.tmp';
+
+      await fs.promises.writeFile(
+        temporary,
+        content,
+        'utf8'
+      );
+
+      await fs.promises.rename(
+        temporary,
+        DATA_PATH
+      );
+    });
+
+  return saveQueue;
+}
+
+// =============================================
+// UTILITY FUNCTIONS
+// =============================================
+
+function escapeText(value) {
+  return String(value ?? '')
+    .replace(/@/g, '＠')
+    .replace(/[`*_~|>]/g, '\\$&');
+}
+
+function timestamp(value) {
+  return `<t:${Math.floor(value / 1000)}:R>`;
+}
+
+function errorMessage(error) {
+  return String(error?.message || error);
+}
+
+// =============================================
+// COMPONENTS V2
+// ALL BANNERS APPEAR AT THE TOP
+// =============================================
+
+function createButton(
+  id,
+  label,
+  style = ButtonStyle.Secondary,
+  disabled = false
+) {
+  return new ButtonBuilder()
+    .setCustomId(id)
+    .setLabel(label)
+    .setStyle(style)
+    .setDisabled(disabled);
+}
+
+function createRow(...components) {
+  return new ActionRowBuilder()
+    .addComponents(...components);
+}
+
+function createPanel(
+  title,
+  content,
+  bannerKey = null,
+  actionRows = []
+) {
+  const container = new ContainerBuilder();
+
+  // Banner appears above everything else.
+  const banner = bannerKey ? ENV[bannerKey] : null;
+
+  if (banner && /^https?:\/\//i.test(banner)) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder().setURL(banner)
+      )
+    );
+  }
+
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      `# ${title}\n\n${content}`
+    )
+  );
+
+  for (const row of actionRows) {
+    container.addActionRowComponents(row);
+  }
+
+  return {
+    components: [container],
+    flags: MessageFlags.IsComponentsV2,
+    allowedMentions: { parse: [] }
+  };
+}
+
+async function replyPrivate(interaction, content) {
+  if (interaction.deferred) {
+    return interaction.editReply({
+      content,
+      allowedMentions: { parse: [] }
+    });
+  }
+
+  if (interaction.replied) {
+    return interaction.followUp({
+      content,
+      flags: MessageFlags.Ephemeral,
+      allowedMentions: { parse: [] }
+    });
+  }
+
+  return interaction.reply({
+    content,
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] }
+  });
+}
+
+// =============================================
+// PERMISSIONS AND MELONLY VERIFICATION
+// =============================================
+
+function memberHasRole(member, roleId) {
+  return Boolean(
+    roleId &&
+    member?.roles?.cache?.has(roleId)
+  );
+}
+
+function hasAdmin(member) {
+  return Boolean(
+    member?.permissions?.has(
+      PermissionFlagsBits.Administrator
+    )
+  );
+}
+
+function hasStaff(member) {
+  return Boolean(
+    hasAdmin(member) ||
+    member?.permissions?.has(
+      PermissionFlagsBits.ManageGuild
+    ) ||
+    memberHasRole(member, ENV.STAFF_ROLE_ID)
+  );
+}
+
+async function staffOnly(interaction) {
+  if (hasStaff(interaction.member)) return true;
+
+  await replyPrivate(
+    interaction,
+    'You do not have permission to use this command.'
+  );
+
+  return false;
+}
+
+async function adminOnly(interaction) {
+  if (hasAdmin(interaction.member)) return true;
+
+  await replyPrivate(
+    interaction,
+    'Administrator permission required.'
+  );
+
+  return false;
+}
+
+function isMelonlyVerified(member) {
+  return memberHasRole(
+    member,
+    ENV.VERIFIED_ROLE_ID
+  );
+}
+
+async function fetchFreshMember(guild, userId) {
+  return guild.members.fetch({
+    user: userId,
+    force: true
+  });
+}
+
+async function checkMelonlyVerification(interaction) {
+  const member = await fetchFreshMember(
+    interaction.guild,
+    interaction.user.id
+  );
+
+  console.log(
+    '\n========== MELONLY ROLE DEBUG =========='
+  );
+
+  console.log(
+    'Discord User:',
+    interaction.user.tag
+  );
+
+  console.log(
+    'Discord User ID:',
+    interaction.user.id
+  );
+
+  console.log(
+    'Configured Verified Role ID:',
+    ENV.VERIFIED_ROLE_ID || 'NOT SET'
+  );
+
+  console.log('Member Roles:');
+
+  for (const role of member.roles.cache.values()) {
+    console.log(`- ${role.name}: ${role.id}`);
+  }
+
+  const verified = isMelonlyVerified(member);
+
+  console.log(
+    'Verified Role Detected:',
+    verified
+  );
+
+  console.log(
+    '========================================\n'
+  );
+
+  return {
+    member,
+    verified
+  };
+}
+
+// =============================================
+// LOGGING
+// =============================================
+
+async function sendLog(title, description) {
+  if (!ENV.LOG_CHANNEL_ID) return;
+
+  try {
+    const channel = await client.channels.fetch(
+      ENV.LOG_CHANNEL_ID
+    );
+
+    if (!channel?.isTextBased()) return;
+
+    await channel.send(
+      createPanel(
+        `Los Angeles Roleplay | ${title}`,
+        description +
+          `\n\n**Logged At:** ${timestamp(Date.now())}`,
+        'LOG_BANNER'
+      )
+    );
+  } catch (error) {
+    console.warn(
+      'Logging error:',
+      errorMessage(error)
+    );
+  }
+}
+
+// =============================================
+// ER:LC API
+// =============================================
+
+async function erlc(endpoint) {
+  if (!ENV.ERLC_API_KEY) {
+    throw new Error(
+      'ERLC_API_KEY is missing from .env'
+    );
+  }
+
+  const response = await fetch(
+    API_BASE + endpoint,
+    {
+      headers: {
+        'Server-Key': ENV.ERLC_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      signal: AbortSignal.timeout(12000)
+    }
+  );
+
+  if (!response.ok) {
+    const details = await response.text();
+
+    throw new Error(
+      `ER:LC API ${response.status}: ${details.slice(0, 350)}`
+    );
+  }
+
+  return response.json();
+}
+
+function parsePlayer(value) {
+  const match = String(value || '').match(
+    /^(.*?)\s*:\s*(\d+)$/
+  );
+
+  if (!match) return null;
+
+  return {
+    username: match[1].trim(),
+    robloxId: match[2]
+  };
+}
+
+function getPlayerInfo(player) {
+  if (!player || typeof player !== 'object') {
+    return parsePlayer(player) || {
+      username: '',
+      robloxId: ''
+    };
+  }
+
+  const parsed = parsePlayer(
+    player.Player ||
+    player.player ||
+    player.Name ||
+    player.name
+  );
+
+  return {
+    username: String(
+      parsed?.username ||
+      player.Username ||
+      player.username ||
+      ''
+    ),
+
+    robloxId: String(
+      parsed?.robloxId ||
+      player.UserId ||
+      player.userId ||
+      player.id ||
+      ''
+    )
+  };
+}
+
+function getQueueIds(queue) {
+  return queue.map(item => {
+    if (typeof item === 'string') {
+      const parsed = parsePlayer(item);
+
+      return parsed?.robloxId ||
+        (/^\d+$/.test(item) ? item : '');
+    }
+
+    if (typeof item === 'number') {
+      return String(item);
+    }
+
+    if (!item || typeof item !== 'object') {
+      return '';
+    }
+
+    const parsed = parsePlayer(
+      item.Player || item.player
+    );
+
+    return String(
+      parsed?.robloxId ||
+      item.UserId ||
+      item.userId ||
+      item.id ||
+      ''
+    );
+  }).filter(Boolean);
+}
+
+async function getServerData() {
+  const [players, queue] = await Promise.all([
+    erlc('/server/players'),
+    erlc('/server/queue')
+  ]);
+
+  if (
+    !Array.isArray(players) ||
+    !Array.isArray(queue)
+  ) {
+    throw new Error(
+      'Unexpected ER:LC player or queue response.'
+    );
+  }
+
+  let server = null;
+
+  try {
+    server = await erlc('/server');
+  } catch (error) {
+    console.warn(
+      'ER:LC server details:',
+      errorMessage(error)
+    );
+  }
+
+  return {
+    players,
+    queue,
+    server
+  };
+}
+
+// =============================================
+// ROBLOX USERNAME LOOKUP
+// =============================================
+
+async function lookupRobloxUsername(username) {
+  const response = await fetch(
+    'https://users.roblox.com/v1/usernames/users',
+    {
+      method: 'POST',
+
+      headers: {
+        'Content-Type': 'application/json'
+      },
+
+      body: JSON.stringify({
+        usernames: [username],
+        excludeBannedUsers: false
+      }),
+
+      signal: AbortSignal.timeout(12000)
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(
+      `Roblox lookup failed: ${response.status}`
+    );
+  }
+
+  const result = await response.json();
+  const user = result.data?.[0];
+
+  if (!user?.id || !user?.name) return null;
+
+  return {
+    robloxId: String(user.id),
+    robloxUsername: user.name
+  };
+}
+
+async function requestRobloxLink(interaction) {
+  if (!ENV.VERIFIED_ROLE_ID) {
+    return replyPrivate(interaction, 'VERIFIED_ROLE_ID is missing from your bot configuration.');
+  }
+
+  const { verified } = await checkMelonlyVerification(interaction);
+  if (!verified) {
+    return replyPrivate(interaction, 'Your Melonly Verified role was not detected. Ask management to check the configured role ID.');
+  }
+
+  if (db.linkedUsers[interaction.user.id]) {
+    const linked = db.linkedUsers[interaction.user.id];
+    return replyPrivate(interaction, `You are already linked to ${escapeText(linked.robloxUsername)}. Contact staff if this is incorrect.`);
+  }
+
+  if (db.pendingLinks[interaction.user.id]) {
+    return replyPrivate(interaction, 'You already have a Roblox link request awaiting staff review.');
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const username = interaction.options.getString('username', true);
+  if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+    return interaction.editReply('Enter a valid Roblox username, not a display name.');
+  }
+
+  const account = await lookupRobloxUsername(username);
+  if (!account) {
+    return interaction.editReply('That Roblox username could not be found.');
+  }
+
+  const duplicateApproved = Object.entries(db.linkedUsers).some(
+    ([discordId, record]) =>
+      discordId !== interaction.user.id &&
+      String(record.robloxId) === account.robloxId
+  );
+
+  const duplicatePending = Object.entries(db.pendingLinks).some(
+    ([discordId, record]) =>
+      discordId !== interaction.user.id &&
+      String(record.robloxId) === account.robloxId
+  );
+
+  if (duplicateApproved || duplicatePending) {
+    return interaction.editReply('This Roblox account is already linked or has a pending link request.');
+  }
+
+  db.pendingLinks[interaction.user.id] = {
+    ...account,
+    requestedAt: Date.now()
+  };
+  await save();
+
+  await sendLog(
+    'Roblox Link Requested',
+    `**Discord User:** <@${interaction.user.id}>\n` +
+    `**Roblox Username:** ${escapeText(account.robloxUsername)}\n` +
+    `**Roblox ID:** ${account.robloxId}\n` +
+    '**Status:** Awaiting staff approval\n\n' +
+    'Staff must independently confirm ownership of the Roblox account.'
+  );
+
+  return interaction.editReply(
+    `Your request to link **${escapeText(account.robloxUsername)}** has been submitted.\n\n` +
+    'Staff must confirm account ownership before approving it. Use /link-status to check your request.'
+  );
+}
+
+async function linkStatus(interaction) {
+  const linked = db.linkedUsers[interaction.user.id];
+  const pending = db.pendingLinks[interaction.user.id];
+
+  if (linked) {
+    return replyPrivate(
+      interaction,
+      `**Status:** Approved\n` +
+      `**Roblox Username:** ${escapeText(linked.robloxUsername)}\n` +
+      `**Roblox ID:** ${linked.robloxId}`
+    );
+  }
+
+  if (pending) {
+    return replyPrivate(
+      interaction,
+      `**Status:** Awaiting staff approval\n` +
+      `**Roblox Username:** ${escapeText(pending.robloxUsername)}\n` +
+      `**Roblox ID:** ${pending.robloxId}`
+    );
+  }
+
+  return replyPrivate(
+    interaction,
+    'You do not have a linked Roblox account. Use /link-roblox after verifying through Melonly.'
+  );
+}
+
+async function approveRobloxLink(interaction) {
+  if (!await staffOnly(interaction)) return;
+
+  const user = interaction.options.getUser('user', true);
+  const pending = db.pendingLinks[user.id];
+
+  if (!pending) {
+    return replyPrivate(interaction, 'That member has no pending Roblox link request.');
+  }
+
+  const member = await fetchFreshMember(interaction.guild, user.id)
+    .catch(() => null);
+
+  if (!member || !isMelonlyVerified(member)) {
+    return replyPrivate(interaction, 'The member must currently have the Melonly Verified role.');
+  }
+
+  const duplicate = Object.entries(db.linkedUsers).some(
+    ([discordId, record]) =>
+      discordId !== user.id &&
+      String(record.robloxId) === pending.robloxId
+  );
+
+  if (duplicate) {
+    return replyPrivate(interaction, 'This Roblox account is already linked to another Discord member.');
+  }
+
+  // Staff must independently confirm Roblox account ownership.
+  db.linkedUsers[user.id] = {
+    robloxId: pending.robloxId,
+    robloxUsername: pending.robloxUsername,
+    linkedAt: Date.now(),
+    approvedBy: interaction.user.id
+  };
+
+  delete db.pendingLinks[user.id];
+  await save();
+
+  await sendLog(
+    'Roblox Link Approved',
+    `**Discord User:** <@${user.id}>\n` +
+    `**Roblox Username:** ${escapeText(pending.robloxUsername)}\n` +
+    `**Roblox ID:** ${pending.robloxId}\n` +
+    `**Approved By:** <@${interaction.user.id}>`
+  );
+
+  await user.send(
+    `Your Roblox account **${pending.robloxUsername}** has been linked to Los Angeles Roleplay.`
+  ).catch(() => {});
+
+  return replyPrivate(
+    interaction,
+    `Approved ${escapeText(pending.robloxUsername)} for <@${user.id}>.`
+  );
+}
+
+async function denyRobloxLink(interaction) {
+  if (!await staffOnly(interaction)) return;
+
+  const user = interaction.options.getUser('user', true);
+  const pending = db.pendingLinks[user.id];
+
+  if (!pending) {
+    return replyPrivate(interaction, 'That member has no pending Roblox link request.');
+  }
+
+  delete db.pendingLinks[user.id];
+  await save();
+
+  await sendLog(
+    'Roblox Link Denied',
+    `**Discord User:** <@${user.id}>\n` +
+    `**Roblox Username:** ${escapeText(pending.robloxUsername)}\n` +
+    `**Denied By:** <@${interaction.user.id}>`
+  );
+
+  await user.send(
+    'Your Roblox account link request was denied. Contact Los Angeles Roleplay staff for assistance.'
+  ).catch(() => {});
+
+  return replyPrivate(interaction, 'Roblox link request denied.');
+}
+
+async function unlinkRoblox(interaction) {
+  if (!await staffOnly(interaction)) return;
+
+  const user = interaction.options.getUser('user', true);
+  const linked = db.linkedUsers[user.id];
+
+  if (!linked) {
+    return replyPrivate(interaction, 'That member does not have an approved Roblox link.');
+  }
+
+  delete db.linkedUsers[user.id];
+  delete db.pendingLinks[user.id];
+  await save();
+
+  const member = await interaction.guild.members.fetch(user.id)
+    .catch(() => null);
+
+  if (member) {
+    for (const roleId of [
+      ENV.ROLEPLAYING_ROLE_ID,
+      ENV.IN_QUEUE_ROLE_ID
+    ]) {
+      if (roleId && member.roles.cache.has(roleId)) {
+        await member.roles.remove(roleId).catch(console.warn);
+      }
+    }
+  }
+
+  await sendLog(
+    'Roblox Account Unlinked',
+    `**Discord User:** <@${user.id}>\n` +
+    `**Previous Roblox Account:** ${escapeText(linked.robloxUsername)}\n` +
+    `**Unlinked By:** <@${interaction.user.id}>`
+  );
+
+  return replyPrivate(interaction, 'Roblox account unlinked successfully.');
+}
+
+// =============================================
+// AUTOMATIC ER:LC ROLES
+// =============================================
+
+async function synchronizeRoles(data) {
+  const guild = client.guilds.cache.get(ENV.GUILD_ID);
+  if (!guild) return;
+
+  const players = new Set(
+    data.players
+      .map(player => getPlayerInfo(player).robloxId)
+      .filter(Boolean)
+  );
+
+  const queue = new Set(getQueueIds(data.queue));
+
+  await guild.members.fetch();
+
+  const roleplayingRole = ENV.ROLEPLAYING_ROLE_ID;
+  const queueRole = ENV.IN_QUEUE_ROLE_ID;
+
+  for (const member of guild.members.cache.values()) {
+    if (member.user.bot) continue;
+
+    const link = db.linkedUsers[member.id];
+    const verified = isMelonlyVerified(member);
+    const robloxId = verified && link ? String(link.robloxId) : null;
+
+    const shouldRoleplay = Boolean(robloxId && players.has(robloxId));
+    const shouldQueue = Boolean(robloxId && queue.has(robloxId));
+
+    const roles = [
+      [roleplayingRole, shouldRoleplay, 'Roleplaying'],
+      [queueRole, shouldQueue, 'In Queue']
+    ];
+
+    for (const [roleId, shouldHave, label] of roles) {
+      if (!roleId) continue;
+
+      const hasRole = member.roles.cache.has(roleId);
+      if (hasRole === shouldHave) continue;
+
+      try {
+        if (shouldHave) {
+          await member.roles.add(roleId);
+        } else {
+          await member.roles.remove(roleId);
+        }
+
+        await sendLog(
+          'ER:LC Role Updated',
+          `**Member:** <@${member.id}>\n` +
+          `**Role:** ${label}\n` +
+          `**Action:** ${shouldHave ? 'Added' : 'Removed'}\n` +
+          `**Roblox Account:** ${escapeText(link?.robloxUsername || 'Not linked')}`
+        );
+      } catch (error) {
+        console.warn(
+          `Role synchronization for ${member.id}:`,
+          errorMessage(error)
+        );
+      }
+    }
+  }
+}
+
+// =============================================
+// NEW LOS ANGELES SESSION INFORMATION PANEL
+// =============================================
+
+// Configure SESSION_BATTERY_EMOJI in .env as:
+// <:battery:123456789012345678>
+// or an animated custom emoji:
+// <a:battery:123456789012345678>
+
+function sessionEmoji(value) {
+  const match = String(value || '').trim().match(
+    /^<(?:(a)?):([A-Za-z0-9_]{2,32}):(\d{17,22})>$/
+  );
+
+  if (match) {
+    return {
+      animated: Boolean(match[1]),
+      name: match[2],
+      id: match[3]
+    };
+  }
+
+  const id = String(value || '').trim();
+
+  if (/^\d{17,22}$/.test(id)) {
+    return { id, name: 'battery' };
+  }
+
+  return null;
+}
+
+function sessionInfoPanel(data = null) {
+  const active = Boolean(db.session.active);
+  const server = data?.server || {};
+
+  const players = data?.players?.length;
+  const queue = data?.queue?.length;
+
+  const serverName = escapeText(
+    ENV.ERLC_SERVER_NAME ||
+    server.Name ||
+    'Los Angeles Roleplay'
+  );
+
+  const joinCode = escapeText(
+    ENV.ERLC_JOIN_CODE ||
+    server.JoinKey ||
+    'Not configured'
+  );
+
+  const owner = escapeText(
+    ENV.ERLC_SERVER_OWNER ||
+    server.Owner ||
+    'Unknown'
+  );
+
+  const maxPlayers = Number(
+    ENV.ERLC_MAX_PLAYERS ||
+    server.MaxPlayers ||
+    40
+  );
+
+  const staffCount = data?.players?.filter(
+    p => p.Permission && p.Permission !== 'Normal'
+  ).length;
+
+  const joinURL = ENV.ERLC_JOIN_URL || '';
+
+  // Green accent when a session is active.
+  // Red accent when the session is offline.
+  const container = new ContainerBuilder()
+    .setAccentColor(active ? 0x28a745 : 0xe53935);
+
+  // TOP BANNER
+  const banner = ENV.SESSION_INFO_BANNER;
+
+  if (banner && /^https?:\/\//i.test(banner)) {
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder().setURL(banner)
+      )
+    );
+  }
+
+  // INTRODUCTION
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      '## Sessions\n' +
+      '> Los Angeles Roleplay sessions run based on staff availability. ' +
+      'Check the status below and join when a session is active.'
+    )
+  );
+
+  container.addSeparatorComponents(
+    separator => separator
+  );
+
+  // SERVER INFORMATION
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      '**ER:LC Server Information**\n' +
+      `• Server Name: \`${serverName}\`\n` +
+      `• Server Join Code: \`${joinCode}\`\n` +
+      `• Server Owner: \`${owner}\``
+    )
+  );
+
+  container.addSeparatorComponents(
+    separator => separator
+  );
+
+  // LIVE SERVER STATISTICS
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(
+      '**Server Statistics**\n' +
+      `• Player Count: \`${
+        players == null
+          ? 'Unavailable'
+          : `${players}/${maxPlayers}`
+      }\`\n` +
+      `• Online Staff: \`${
+        staffCount == null
+          ? 'Unavailable'
+          : staffCount
+      }\`\n` +
+      `• In Queue: \`${
+        queue == null
+          ? 'Unavailable'
+          : queue
+      }\`\n\n` +
+      `Updated ${timestamp(Date.now())}`
+    )
+  );
+
+  // OPTIONAL FOOTER BANNER
+  const footer = ENV.SESSION_FOOTER_BANNER;
+
+  if (footer && /^https?:\/\//i.test(footer)) {
+    container.addSeparatorComponents(
+      separator => separator
+    );
+
+    container.addMediaGalleryComponents(
+      new MediaGalleryBuilder().addItems(
+        new MediaGalleryItemBuilder().setURL(footer)
+      )
+    );
+  }
+
+  // CUSTOM BATTERY STATUS BUTTON
+  const status = new ButtonBuilder()
+    .setCustomId('session_status_indicator')
+    .setLabel(active ? 'Online' : 'Offline')
+    .setStyle(
+      active
+        ? ButtonStyle.Success
+        : ButtonStyle.Danger
+    )
+    .setDisabled(true);
+
+  const emoji = sessionEmoji(
+    ENV.SESSION_BATTERY_EMOJI
+  );
+
+  if (emoji) {
+    status.setEmoji(emoji);
+  }
+
+  const row = new ActionRowBuilder()
+    .addComponents(status);
+
+  // JOIN IN-GAME BUTTON
+  if (joinURL && /^https?:\/\//i.test(joinURL)) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setLabel('Join In-game')
+        .setStyle(ButtonStyle.Link)
+        .setURL(joinURL)
+    );
+  }
+
+  // SESSION PING BUTTON
+  if (ENV.SESSION_PING_ROLE_ID) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId('session_ping_button')
+        .setLabel('Session Ping')
+        .setStyle(ButtonStyle.Secondary)
+    );
+  }
+
+  container.addActionRowComponents(row);
+
+  return {
+    components: [container],
+    flags: MessageFlags.IsComponentsV2,
+    allowedMentions: { parse: [] }
+  };
+}
+
+// =============================================
+// CREATE OR UPDATE SESSION INFO MESSAGE
+// =============================================
+
+async function updateSessionInfo(data = null) {
+  if (!ENV.SESSION_INFO_CHANNEL_ID) return;
+
+  const channel = await client.channels
+    .fetch(ENV.SESSION_INFO_CHANNEL_ID)
+    .catch(() => null);
+
+  if (!channel?.isTextBased()) return;
+
+  let info = data;
+
+  if (!info && ENV.ERLC_API_KEY) {
+    try {
+      info = await getServerData();
+    } catch (error) {
+      console.warn(
+        'Session information API:',
+        errorMessage(error)
+      );
+    }
+  }
+
+  let message = null;
+
+  if (db.session.infoMessageId) {
+    message = await channel.messages
+      .fetch(db.session.infoMessageId)
+      .catch(() => null);
+  }
+
+  if (message) {
+    await message.edit(
+      sessionInfoPanel(info)
+    );
+  } else {
+    message = await channel.send(
+      sessionInfoPanel(info)
+    );
+
+    db.session.infoMessageId = message.id;
+    await save();
+  }
+
+  if (!message.pinned) {
+    await message.pin().catch(console.warn);
+  }
+}
+
+// =============================================
+// SESSION ANNOUNCEMENTS
+// =============================================
+
+function sessionAnnouncement(data = null) {
+  const playerCount = data?.players?.length ?? 'Unavailable';
+  const queueCount = data?.queue?.length ?? 'Unavailable';
+
+  return createPanel(
+    'Los Angeles Roleplay | Session Started',
+    '**Our roleplay session has officially started!**\n\n' +
+    '### Session Information\n' +
+    `**Session Host:** <@${db.session.hostId}>\n` +
+    `**Server Name:** ${escapeText(ENV.ERLC_SERVER_NAME || 'Los Angeles Roleplay')}\n` +
+    `**Join Code:** \`${escapeText(ENV.ERLC_JOIN_CODE || 'Not configured')}\`\n` +
+    `**Players In-Game:** ${playerCount}\n` +
+    `**Players In Queue:** ${queueCount}\n\n` +
+    'Join the server and enjoy your roleplay experience!',
+    'SESSION_START_BANNER'
+  );
+}
+
+async function updateSessionAnnouncement(data) {
+  if (
+    !db.session.active ||
+    !db.session.messageId ||
+    !db.session.channelId
+  ) {
+    return;
+  }
+
+  try {
+    const channel = await client.channels.fetch(
+      db.session.channelId
+    );
+
+    if (!channel?.isTextBased()) return;
+
+    const message = await channel.messages.fetch(
+      db.session.messageId
+    );
+
+    await message.edit(
+      sessionAnnouncement(data)
+    );
+  } catch (error) {
+    console.warn(
+      'Session announcement update:',
+      errorMessage(error)
+    );
+  }
+}
+
+// =============================================
+// SESSION START
+// =============================================
+
+async function startSession(interaction) {
+  if (!await staffOnly(interaction)) return;
+
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral
+  });
+
+  if (db.session.active) {
+    return interaction.editReply(
+      'A session is already active.'
+    );
+  }
+
+  let data = null;
+
+  try {
+    data = await getServerData();
+  } catch (error) {
+    console.warn(
+      'Session start API:',
+      errorMessage(error)
+    );
+  }
+
+  db.session.active = true;
+  db.session.startedAt = Date.now();
+  db.session.hostId = interaction.user.id;
+  db.session.channelId = interaction.channelId;
+  db.session.messageId = null;
+  db.vote = null;
+
+  const message = await interaction.channel.send(
+    sessionAnnouncement(data)
+  );
+
+  db.session.messageId = message.id;
+  await save();
+
+  await sendLog(
+    'Session Started',
+    `**Host:** <@${interaction.user.id}>\n` +
+    `**Players:** ${data?.players?.length ?? 'Unavailable'}\n` +
+    `**Queue:** ${data?.queue?.length ?? 'Unavailable'}`
+  );
+
+  // This changes the session information panel
+  // to GREEN with the configured battery emoji.
+  await updateSessionInfo(data).catch(error => {
+    console.warn(
+      'Session info update:',
+      errorMessage(error)
+    );
+  });
+
+  return interaction.editReply(
+    'Session started successfully. The session information panel is now online.'
+  );
+}
+
+// =============================================
+// SESSION SHUTDOWN
+// =============================================
+
+async function shutdownSession(interaction) {
+  if (!await staffOnly(interaction)) return;
+
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral
+  });
+
+  if (!db.session.active) {
+    return interaction.editReply(
+      'There is no active session to shut down.'
+    );
+  }
+
+  db.session.active = false;
+  db.session.startedAt = null;
+  db.session.hostId = null;
+  db.session.messageId = null;
+  db.session.channelId = null;
+  db.vote = null;
+
+  await save();
+
+  await interaction.channel.send(
+    createPanel(
+      'Los Angeles Roleplay | Session Shutdown',
+      '**The roleplay session has officially ended.**\n\n' +
+      'Thank you to everyone who participated!\n\n' +
+      'Please watch the session announcements for future sessions.',
+      'SESSION_SHUTDOWN_BANNER'
+    )
+  );
+
+  await sendLog(
+    'Session Shutdown',
+    `**Ended By:** <@${interaction.user.id}>`
+  );
+
+  // This changes the session information panel
+  // to RED with the configured battery emoji.
+  await updateSessionInfo().catch(error => {
+    console.warn(
+      'Session info update:',
+      errorMessage(error)
+    );
+  });
+
+  return interaction.editReply(
+    'Session shut down successfully. The session information panel is now offline.'
+  );
+}
+
+// =============================================
+// SESSION VOTING
+// =============================================
+
+function sessionVotePanel() {
+  const count = db.vote?.voters?.length || 0;
+  const reached = count >= 4;
+
+  return createPanel(
+    'Los Angeles Roleplay | Session Vote',
+    '**Would you like a roleplay session to start?**\n\n' +
+    `**Current Votes:** ${count}/4\n` +
+    '**Required Votes:** 4\n\n' +
+    (
+      reached
+        ? 'The required number of votes has been reached. Staff may start a session.'
+        : 'Press the button below to vote for a session. Each member may vote once.'
+    ),
+    'SESSION_VOTE_BANNER',
+    [
+      createRow(
+        createButton(
+          `session_vote_${db.vote.id}`,
+          `Vote (${count}/4)`,
+          ButtonStyle.Primary,
+          reached
+        )
+      )
+    ]
+  );
+}
+
+async function createSessionVote(interaction) {
+  if (!await staffOnly(interaction)) return;
+
+  if (db.session.active) {
+    return replyPrivate(
+      interaction,
+      'A session is already active.'
+    );
+  }
+
+  if (db.vote && db.vote.voters.length < 4) {
+    return replyPrivate(
+      interaction,
+      'A session vote is already open.'
+    );
+  }
+
+  db.vote = {
+    id: crypto.randomBytes(4).toString('hex'),
+    voters: [],
+    createdAt: Date.now()
+  };
+
+  await save();
+
+  await interaction.channel.send(
+    sessionVotePanel()
+  );
+
+  return replyPrivate(
+    interaction,
+    'Session vote posted successfully.'
+  );
+}
+
+const voteLocks = new Set();
+
+async function castSessionVote(interaction) {
+  const voteId = interaction.customId.replace(
+    'session_vote_',
+    ''
+  );
+
+  if (!db.vote || db.vote.id !== voteId) {
+    return replyPrivate(
+      interaction,
+      'This session vote is no longer active.'
+    );
+  }
+
+  if (voteLocks.has(voteId)) {
+    return replyPrivate(
+      interaction,
+      'Another vote is being processed. Try again.'
+    );
+  }
+
+  voteLocks.add(voteId);
+
+  try {
+    if (db.vote.voters.includes(interaction.user.id)) {
+      return replyPrivate(
+        interaction,
+        'You have already voted for this session.'
+      );
+    }
+
+    if (db.vote.voters.length >= 4) {
+      return replyPrivate(
+        interaction,
+        'The session vote has already reached 4/4.'
+      );
+    }
+
+    db.vote.voters.push(interaction.user.id);
+    await save();
+
+    await interaction.update(
+      sessionVotePanel()
+    );
+
+    if (db.vote.voters.length === 4) {
+      await interaction.channel.send({
+        content:
+          '**Session Vote Complete!**\n\n' +
+          'The vote has reached **4/4**. A session host may now start the session.',
+        allowedMentions: { parse: [] }
+      });
+
+      await sendLog(
+        'Session Vote Completed',
+        '**Votes:** 4/4\n' +
+        `**Channel:** <#${interaction.channelId}>`
+      );
+    }
+  } finally {
+    voteLocks.delete(voteId);
+  }
+}
+
+// =============================================
+// SESSION PING BUTTON
+// =============================================
+
+const sessionPingCooldowns = new Map();
+const SESSION_PING_COOLDOWN_MS = 5 * 60 * 1000;
+
+async function handleSessionPing(interaction) {
+  if (!interaction.inGuild()) return;
+
+  const roleId = ENV.SESSION_PING_ROLE_ID;
+
+  if (!roleId) {
+    return replyPrivate(
+      interaction,
+      'SESSION_PING_ROLE_ID is not configured.'
+    );
+  }
+
+  const role = await interaction.guild.roles.fetch(
+    roleId
+  ).catch(() => null);
+
+  if (!role) {
+    return replyPrivate(
+      interaction,
+      'The configured session ping role could not be found.'
+    );
+  }
+
+  // The button lets members opt into or out of
+  // receiving future session announcements.
+  const member = await interaction.guild.members.fetch(
+    interaction.user.id
+  );
+
+  if (member.roles.cache.has(roleId)) {
+    await member.roles.remove(roleId);
+
+    return replyPrivate(
+      interaction,
+      'You will no longer receive session pings.'
+    );
+  }
+
+  await member.roles.add(roleId);
+
+  return replyPrivate(
+    interaction,
+    'You will now receive session pings.'
+  );
+}
+
+// =============================================
+// TICKET DEPARTMENTS
+// =============================================
+
+const ticketTypes = {
+  directorship: {
+    label: 'Directorship Tickets',
+    category: 'DIRECTORSHIP_CATEGORY_ID',
+    pingRole: 'DIRECTORSHIP_PING_ROLE_ID',
+    prefix: 'directorship'
+  },
+
+  report: {
+    label: 'Report Tickets',
+    category: 'REPORT_CATEGORY_ID',
+    pingRole: 'REPORT_PING_ROLE_ID',
+    prefix: 'report'
+  },
+
+  support: {
+    label: 'General Support Tickets',
+    category: 'SUPPORT_CATEGORY_ID',
+    pingRole: 'SUPPORT_PING_ROLE_ID',
+    prefix: 'support'
+  }
+};
+
+function canManageTicket(member, ticket) {
+  if (hasStaff(member)) return true;
+
+  const config = ticketTypes[ticket.type];
+
+  return Boolean(
+    config &&
+    memberHasRole(member, ENV[config.pingRole])
+  );
+}
+
+// =============================================
+// TICKET PANEL
+// =============================================
+
+function ticketPanel() {
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('ticket_type')
+    .setPlaceholder('Select a ticket department');
+
+  for (const [key, type] of Object.entries(ticketTypes)) {
+    menu.addOptions(
+      new StringSelectMenuOptionBuilder()
+        .setLabel(type.label)
+        .setValue(key)
+        .setDescription(
+          `Create a ${type.label.toLowerCase()} ticket`
+        )
+    );
+  }
+
+  return createPanel(
+    'Los Angeles Roleplay | Support Center',
+    '**Welcome to the Los Angeles Roleplay Support System.**\n\n' +
+    'Select the department that best matches your inquiry.\n\n' +
+    '**Directorship Tickets**\n' +
+    'Leadership inquiries and management concerns.\n\n' +
+    '**Report Tickets**\n' +
+    'Player reports, staff reports, and rule violations.\n\n' +
+    '**General Support Tickets**\n' +
+    'Questions, technical support, and general assistance.',
+    'TICKET_PANEL_BANNER',
+    [createRow(menu)]
+  );
+}
+
+// =============================================
+// TICKET MODAL
+// =============================================
+
+async function showTicketModal(interaction) {
+  const type = interaction.values[0];
+
+  if (!ticketTypes[type]) {
+    return replyPrivate(
+      interaction,
+      'Invalid ticket department.'
+    );
+  }
+
+  const modal = new ModalBuilder()
+    .setCustomId(`ticket_modal_${type}`)
+    .setTitle('Los Angeles Roleplay Support');
+
+  const subject = new TextInputBuilder()
+    .setCustomId('ticket_subject')
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder('Briefly describe your inquiry')
+    .setMinLength(3)
+    .setMaxLength(100)
+    .setRequired(true);
+
+  const description = new TextInputBuilder()
+    .setCustomId('ticket_description')
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder('Explain your request in detail')
+    .setMinLength(10)
+    .setMaxLength(1500)
+    .setRequired(true);
+
+  modal.addLabelComponents(
+    new LabelBuilder()
+      .setLabel('Inquiry Subject')
+      .setTextInputComponent(subject),
+
+    new LabelBuilder()
+      .setLabel('Describe Your Inquiry')
+      .setTextInputComponent(description)
+  );
+
+  return interaction.showModal(modal);
+}
+
+// =============================================
+// TICKET INFORMATION PANEL
+// =============================================
+
+function ticketInformationPanel(ticket) {
+  const config = ticketTypes[ticket.type];
+  const claimed = Boolean(ticket.claimedBy);
+
+  return createPanel(
+    'Los Angeles Roleplay | Ticket Information',
+    `**Department:** ${config?.label || ticket.type}\n` +
+    `**Opened By:** <@${ticket.owner}>\n` +
+    `**Subject:** ${escapeText(ticket.subject)}\n\n` +
+    '### Inquiry Description\n' +
+    escapeText(ticket.description) +
+    '\n\n' +
+    `**Status:** ${claimed ? 'Claimed' : 'Awaiting Staff'}\n` +
+    `**Assigned Staff:** ${
+      claimed ? `<@${ticket.claimedBy}>` : 'None'
+    }\n\n` +
+    (
+      claimed
+        ? 'A staff member is now handling this ticket.'
+        : 'Automated support may answer common questions while you wait.'
+    ),
+    'TICKET_WELCOME_BANNER',
+    [
+      createRow(
+        createButton(
+          'ticket_claim',
+          claimed ? 'Ticket Claimed' : 'Claim Ticket',
+          ButtonStyle.Success,
+          claimed
+        ),
+
+        createButton(
+          'ticket_close',
+          'Close Ticket',
+          ButtonStyle.Danger
+        )
+      )
+    ]
+  );
+}
+
+// =============================================
+// CREATE TICKET
+// =============================================
+
+const creatingTickets = new Set();
+
+async function submitTicketModal(interaction) {
+  const type = interaction.customId.replace(
+    'ticket_modal_',
+    ''
+  );
+
+  const config = ticketTypes[type];
+
+  if (!config) {
+    return replyPrivate(
+      interaction,
+      'Invalid ticket type.'
+    );
+  }
+
+  const subject = interaction.fields.getTextInputValue(
+    'ticket_subject'
+  );
+
+  const description = interaction.fields.getTextInputValue(
+    'ticket_description'
+  );
+
+  const lockKey = `${interaction.user.id}:${type}`;
+
+  if (creatingTickets.has(lockKey)) {
+    return replyPrivate(
+      interaction,
+      'Your ticket is already being created.'
+    );
+  }
+
+  creatingTickets.add(lockKey);
+
+  try {
+    await interaction.deferReply({
+      flags: MessageFlags.Ephemeral
+    });
+
+    const existing = Object.entries(db.tickets)
+      .find(([, ticket]) =>
+        ticket.owner === interaction.user.id &&
+        ticket.type === type
+      );
+
+    if (existing) {
+      const existingChannel = await interaction.guild.channels
+        .fetch(existing[0])
+        .catch(() => null);
+
+      if (existingChannel) {
+        return interaction.editReply(
+          `You already have a ticket: <#${existing[0]}>`
+        );
+      }
+
+      delete db.tickets[existing[0]];
+      await save();
+    }
+
+    const categoryId = ENV[config.category];
+
+    if (!categoryId) {
+      return interaction.editReply(
+        'This ticket category is not configured.'
+      );
+    }
+
+    const departmentRoleId = ENV[config.pingRole];
+
+    const uniqueRoles = [
+      ...new Set([
+        ENV.STAFF_ROLE_ID,
+        departmentRoleId
+      ].filter(Boolean))
+    ];
+
+    const overwrites = [
+      {
+        id: interaction.guild.id,
+        deny: [
+          PermissionFlagsBits.ViewChannel
+        ]
+      },
+      {
+        id: interaction.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory
+        ]
+      },
+      {
+        id: client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory,
+          PermissionFlagsBits.ManageChannels
+        ]
+      },
+      ...uniqueRoles.map(roleId => ({
+        id: roleId,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.ReadMessageHistory
+        ]
+      }))
+    ];
+
+    const channel = await interaction.guild.channels.create({
+      name: `${config.prefix}-${interaction.user.id}`,
+      type: ChannelType.GuildText,
+      parent: categoryId,
+      permissionOverwrites: overwrites
+    });
+
+    db.tickets[channel.id] = {
+      owner: interaction.user.id,
+      type,
+      subject,
+      description,
+      claimedBy: null,
+      answered: [],
+      createdAt: Date.now()
+    };
+
+    await save();
+
+    const staffPing = departmentRoleId
+      ? ` <@&${departmentRoleId}>`
+      : '';
+
+    await channel.send({
+      content:
+        `<@${interaction.user.id}>${staffPing}\n\n` +
+        'Welcome to the Los Angeles Roleplay support system. ' +
+        'This is an automated response. I will assist you ' +
+        'until a staff member claims this ticket.',
+      allowedMentions: {
+        users: [interaction.user.id],
+        roles: departmentRoleId ? [departmentRoleId] : []
+      }
+    });
+
+    await channel.send(
+      ticketInformationPanel(db.tickets[channel.id])
+    );
+
+    await sendLog(
+      'Ticket Created',
+      `**User:** <@${interaction.user.id}>\n` +
+      `**Department:** ${config.label}\n` +
+      `**Channel:** <#${channel.id}>\n` +
+      `**Subject:** ${escapeText(subject)}`
+    );
+
+    return interaction.editReply(
+      `Your ticket has been created: <#${channel.id}>`
+    );
+  } finally {
+    creatingTickets.delete(lockKey);
+  }
+}
+
+// =============================================
+// CLAIM TICKET
+// =============================================
+
+async function claimTicket(interaction) {
+  const ticket = db.tickets[interaction.channelId];
+
+  if (!ticket) {
+    return replyPrivate(
+      interaction,
+      'This channel is not a ticket.'
+    );
+  }
+
+  if (!canManageTicket(interaction.member, ticket)) {
+    return replyPrivate(
+      interaction,
+      'You do not have permission to claim this ticket.'
+    );
+  }
+
+  if (ticket.claimedBy) {
+    return replyPrivate(
+      interaction,
+      `This ticket is already claimed by <@${ticket.claimedBy}>.`
+    );
+  }
+
+  ticket.claimedBy = interaction.user.id;
+  await save();
+
+  if (interaction.isButton()) {
+    await interaction.update(
+      ticketInformationPanel(ticket)
+    );
+  } else {
+    await replyPrivate(
+      interaction,
+      'Ticket claimed successfully.'
+    );
+  }
+
+  await interaction.channel.send({
+    content:
+      `This ticket has been claimed by <@${interaction.user.id}>.\n\n` +
+      'Automated responses have now been disabled.',
+    allowedMentions: {
+      users: [interaction.user.id]
+    }
+  });
+
+  await sendLog(
+    'Ticket Claimed',
+    `**Staff:** <@${interaction.user.id}>\n` +
+    `**Ticket:** <#${interaction.channelId}>\n` +
+    `**Owner:** <@${ticket.owner}>`
+  );
+}
+
+// =============================================
+// CLOSE TICKET
+// =============================================
+
+async function closeTicket(interaction) {
+  const ticket = db.tickets[interaction.channelId];
+
+  if (!ticket) {
+    return replyPrivate(
+      interaction,
+      'This channel is not a ticket.'
+    );
+  }
+
+  if (
+    interaction.user.id !== ticket.owner &&
+    !canManageTicket(interaction.member, ticket)
+  ) {
+    return replyPrivate(
+      interaction,
+      'Only the ticket owner or staff can close this ticket.'
+    );
+  }
+
+  await interaction.reply({
+    content: 'This ticket will close in 5 seconds.',
+    allowedMentions: { parse: [] }
+  });
+
+  await sendLog(
+    'Ticket Closed',
+    `**Closed By:** <@${interaction.user.id}>\n` +
+    `**Owner:** <@${ticket.owner}>\n` +
+    `**Department:** ${ticketTypes[ticket.type]?.label || ticket.type}\n` +
+    `**Subject:** ${escapeText(ticket.subject)}`
+  );
+
+  delete db.tickets[interaction.channelId];
+  await save();
+
+  setTimeout(async () => {
+    await interaction.channel.delete(
+      'Support ticket closed'
+    ).catch(console.warn);
+  }, 5000);
+}
+
+// =============================================
+// AUTOMATED TICKET RESPONSES
+// =============================================
+
+function loadResponses() {
+  try {
+    const file = JSON.parse(
+      fs.readFileSync(RESPONSES_PATH, 'utf8')
+    );
+
+    return Array.isArray(file.responses)
+      ? file.responses
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function automatedTicketReply(message, ticket) {
+  if (message.author.bot || ticket.claimedBy) return;
+
+  const content = message.content.toLowerCase();
+  const responses = loadResponses();
+
+  if (!Array.isArray(ticket.answered)) {
+    ticket.answered = [];
+  }
+
+  for (const [index, response] of responses.entries()) {
+    if (!Array.isArray(response.keywords)) continue;
+
+    const key = JSON.stringify(response.keywords);
+
+    if (
+      ticket.answered.includes(key) ||
+      ticket.answered.includes(index)
+    ) {
+      continue;
+    }
+
+    const matches = response.keywords.some(
+      keyword =>
+        typeof keyword === 'string' &&
+        keyword.length > 2 &&
+        content.includes(keyword.toLowerCase())
+    );
+
+    if (!matches) continue;
+
+    const reply = String(response.reply || '').trim();
+    if (!reply) continue;
+
+    ticket.answered.push(key);
+    await save();
+
+    await message.channel.send({
+      content: reply.slice(0, 2000),
+      allowedMentions: { parse: [] }
+    });
+
+    break;
+  }
+}
+
+// =============================================
+// DM SUPPORT / MODMAIL
+// =============================================
+
+const creatingDMChannels = new Set();
+
+function dmSupportStaffRole() {
+  return (
+    ENV.DM_SUPPORT_STAFF_ROLE_ID ||
+    ENV.STAFF_ROLE_ID ||
+    null
+  );
+}
+
+function canManageDMSupport(member) {
+  return Boolean(
+    hasStaff(member) ||
+    memberHasRole(member, dmSupportStaffRole())
+  );
+}
+
+function findDMSupportByUser(userId) {
+  return Object.entries(db.dmSupport || {}).find(
+    ([, record]) => record.userId === userId
+  );
+}
+
+function findDMSupportByChannel(channelId) {
+  return db.dmSupport?.[channelId] || null;
+}
+
+function dmSupportPanel(record) {
+  const claimed = Boolean(record.claimedBy);
+
+  return createPanel(
+    'Los Angeles Roleplay | DM Support',
+    '### Support Conversation\n' +
+    `**Member:** <@${record.userId}>\n` +
+    `**User ID:** ${record.userId}\n` +
+    `**Opened:** ${timestamp(record.createdAt)}\n` +
+    `**Status:** ${claimed ? 'Claimed' : 'Awaiting Staff'}\n` +
+    `**Assigned Staff:** ${
+      claimed ? `<@${record.claimedBy}>` : 'None'
+    }\n\n` +
+    '### Staff Instructions\n' +
+    'Send a message in this channel to reply to the member through DMs.\n\n' +
+    'Use **Claim Conversation** to assign the conversation to yourself.\n' +
+    'Use **Close Conversation** when the request has been resolved.\n\n' +
+    'Messages and attachments from the member will appear here.',
+    'DM_SUPPORT_BANNER',
+    [
+      createRow(
+        createButton(
+          'dm_support_claim',
+          claimed ? 'Conversation Claimed' : 'Claim Conversation',
+          ButtonStyle.Success,
+          claimed
+        ),
+        createButton(
+          'dm_support_close',
+          'Close Conversation',
+          ButtonStyle.Danger
+        )
+      )
+    ]
+  );
+}
+
+function attachmentLinks(message) {
+  return [...message.attachments.values()]
+    .map(file => file.url)
+    .filter(url => /^https?:\/\//i.test(url));
+}
+
+function messageParts(content, prefix, attachments = []) {
+  const text = String(content || '').trim();
+
+  const combined = [
+    prefix,
+    text || (attachments.length ? 'Attachment received.' : ''),
+    ...attachments.map(url => `Attachment: ${url}`)
+  ].filter(Boolean).join('\n\n');
+
+  if (!combined.trim()) return [];
+
+  const parts = [];
+  let remaining = combined;
+
+  while (remaining.length > 0) {
+    parts.push(remaining.slice(0, 1900));
+    remaining = remaining.slice(1900);
+  }
+
+  return parts;
+}
+
+async function sendMessageParts(
+  channel,
+  content,
+  prefix,
+  attachments
+) {
+  const parts = messageParts(
+    content,
+    prefix,
+    attachments
+  );
+
+  for (const part of parts) {
+    await channel.send({
+      content: part,
+      allowedMentions: { parse: [] }
+    });
+  }
+}
+
+async function createDMSupportChannel(user) {
+  const guild = await client.guilds.fetch(ENV.GUILD_ID);
+
+  const categoryId =
+    ENV.DM_SUPPORT_CATEGORY_ID ||
+    ENV.SUPPORT_CATEGORY_ID;
+
+  if (!categoryId) {
+    throw new Error(
+      'DM_SUPPORT_CATEGORY_ID or SUPPORT_CATEGORY_ID must be configured.'
+    );
+  }
+
+  const category = await guild.channels.fetch(
+    categoryId
+  );
+
+  if (
+    !category ||
+    category.type !== ChannelType.GuildCategory
+  ) {
+    throw new Error(
+      'DM support category must be a valid Discord category.'
+    );
+  }
+
+  const staffRoleId = dmSupportStaffRole();
+
+  if (!staffRoleId) {
+    throw new Error(
+      'Configure DM_SUPPORT_STAFF_ROLE_ID or STAFF_ROLE_ID.'
+    );
+  }
+
+  const overwrites = [
+    {
+      id: guild.id,
+      deny: [
+        PermissionFlagsBits.ViewChannel
+      ]
+    },
+    {
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+        PermissionFlagsBits.ManageChannels
+      ]
+    },
+    {
+      id: staffRoleId,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory
+      ]
+    }
+  ];
+
+  if (
+    ENV.STAFF_ROLE_ID &&
+    ENV.STAFF_ROLE_ID !== staffRoleId
+  ) {
+    overwrites.push({
+      id: ENV.STAFF_ROLE_ID,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory
+      ]
+    });
+  }
+
+  const channel = await guild.channels.create({
+    name: `dm-${user.id}`,
+    type: ChannelType.GuildText,
+    parent: category.id,
+    permissionOverwrites: overwrites,
+    topic: `DM Support for ${user.id}`
+  });
+
+  const record = {
+    userId: user.id,
+    claimedBy: null,
+    createdAt: Date.now(),
+    panelMessageId: null
+  };
+
+  db.dmSupport[channel.id] = record;
+  await save();
+
+  const panel = await channel.send(
+    dmSupportPanel(record)
+  );
+
+  record.panelMessageId = panel.id;
+  await save();
+
+  await channel.send({
+    content:
+      `<@&${staffRoleId}> New DM support conversation opened by <@${user.id}>.`,
+    allowedMentions: {
+      roles: [staffRoleId],
+      users: []
+    }
+  });
+
+  await sendLog(
+    'DM Support Opened',
+    `**Member:** <@${user.id}>\n` +
+    `**Channel:** <#${channel.id}>`
+  );
+
+  return channel;
+}
+
+async function handleIncomingDM(message) {
+  if (message.author.bot) return;
+
+  if (creatingDMChannels.has(message.author.id)) {
+    return;
+  }
+
+  creatingDMChannels.add(message.author.id);
+
+  try {
+    let existing = findDMSupportByUser(
+      message.author.id
+    );
+
+    let channel = null;
+    let isNew = false;
+
+    if (existing) {
+      channel = await client.channels.fetch(
+        existing[0]
+      ).catch(() => null);
+
+      if (!channel) {
+        delete db.dmSupport[existing[0]];
+        await save();
+        existing = null;
+      }
+    }
+
+    if (!existing) {
+      channel = await createDMSupportChannel(
+        message.author
+      );
+      isNew = true;
+    }
+
+    if (!channel?.isTextBased()) {
+      throw new Error(
+        'DM support channel is unavailable.'
+      );
+    }
+
+    await sendMessageParts(
+      channel,
+      message.content,
+      `**Message from ${escapeText(message.author.username)}** (${message.author.id})`,
+      attachmentLinks(message)
+    );
+
+    if (isNew) {
+      await message.author.send(
+        createPanel(
+          'Los Angeles Roleplay | DM Support',
+          'Your support conversation has been opened.\n\n' +
+          'Your messages will be forwarded to the Los Angeles Roleplay support team.\n\n' +
+          'A staff member will respond as soon as possible.\n\n' +
+          'You can continue replying directly in this DM.',
+          'DM_SUPPORT_BANNER'
+        )
+      ).catch(() => {});
+    }
+  } catch (error) {
+    console.error(
+      'Incoming DM support error:',
+      errorMessage(error)
+    );
+
+    await message.author.send({
+      content:
+        'Your support message could not be delivered. Please try again later or contact server management.',
+      allowedMentions: { parse: [] }
+    }).catch(() => {});
+  } finally {
+    creatingDMChannels.delete(message.author.id);
+  }
+}
+
+async function handleStaffDMReply(message) {
+  const record = findDMSupportByChannel(
+    message.channelId
+  );
+
+  if (!record || message.author.bot) return false;
+
+  const member = await message.guild.members.fetch(
+    message.author.id
+  ).catch(() => null);
+
+  if (!member || !canManageDMSupport(member)) {
+    return true;
+  }
+
+  const content = message.content.trim();
+  const attachments = attachmentLinks(message);
+
+  if (!content && !attachments.length) {
+    return true;
+  }
+
+  const user = await client.users.fetch(
+    record.userId
+  ).catch(() => null);
+
+  if (!user) {
+    await message.reply({
+      content: 'The member could not be found.',
+      allowedMentions: {
+        repliedUser: false,
+        parse: []
+      }
+    });
+
+    return true;
+  }
+
+  try {
+    const parts = messageParts(
+      content,
+      `**Los Angeles Roleplay Support — ${escapeText(message.author.username)}**`,
+      attachments
+    );
+
+    for (const part of parts) {
+      await user.send({
+        content: part,
+        allowedMentions: { parse: [] }
+      });
+    }
+
+    await message.react('✔').catch(() => {});
+  } catch (error) {
+    await message.reply({
+      content:
+        'Your message could not be delivered. The member may have disabled DMs.',
+      allowedMentions: {
+        repliedUser: false,
+        parse: []
+      }
+    });
+  }
+
+  return true;
+}
+
+async function updateDMSupportPanel(channel, record) {
+  if (!record.panelMessageId) return;
+
+  const panel = await channel.messages.fetch(
+    record.panelMessageId
+  ).catch(() => null);
+
+  if (panel) {
+    await panel.edit(
+      dmSupportPanel(record)
+    );
+  }
+}
+
+async function claimDMSupport(interaction) {
+  const record = findDMSupportByChannel(
+    interaction.channelId
+  );
+
+  if (!record) {
+    return replyPrivate(
+      interaction,
+      'This is not a DM support channel.'
+    );
+  }
+
+  if (!canManageDMSupport(interaction.member)) {
+    return replyPrivate(
+      interaction,
+      'You do not have permission to claim this conversation.'
+    );
+  }
+
+  if (record.claimedBy) {
+    return replyPrivate(
+      interaction,
+      `This conversation is already claimed by <@${record.claimedBy}>.`
+    );
+  }
+
+  record.claimedBy = interaction.user.id;
+  await save();
+
+  if (interaction.isButton()) {
+    await interaction.update(
+      dmSupportPanel(record)
+    );
+  } else {
+    await replyPrivate(
+      interaction,
+      'DM support conversation claimed.'
+    );
+
+    await updateDMSupportPanel(
+      interaction.channel,
+      record
+    );
+  }
+
+  await interaction.channel.send({
+    content:
+      `This conversation has been claimed by <@${interaction.user.id}>.`,
+    allowedMentions: {
+      users: [interaction.user.id]
+    }
+  });
+
+  const user = await client.users.fetch(
+    record.userId
+  ).catch(() => null);
+
+  if (user) {
+    await user.send({
+      content:
+        'A Los Angeles Roleplay staff member has claimed your support conversation.',
+      allowedMentions: { parse: [] }
+    }).catch(() => {});
+  }
+
+  await sendLog(
+    'DM Support Claimed',
+    `**Staff:** <@${interaction.user.id}>\n` +
+    `**Member:** <@${record.userId}>\n` +
+    `**Channel:** <#${interaction.channelId}>`
+  );
+}
+
+async function closeDMSupport(interaction) {
+  const record = findDMSupportByChannel(
+    interaction.channelId
+  );
+
+  if (!record) {
+    return replyPrivate(
+      interaction,
+      'This is not a DM support channel.'
+    );
+  }
+
+  if (!canManageDMSupport(interaction.member)) {
+    return replyPrivate(
+      interaction,
+      'You do not have permission to close this conversation.'
+    );
+  }
+
+  await interaction.reply({
+    content:
+      'This DM support conversation will close in 5 seconds.',
+    allowedMentions: { parse: [] }
+  });
+
+  const user = await client.users.fetch(
+    record.userId
+  ).catch(() => null);
+
+  if (user) {
+    await user.send(
+      createPanel(
+        'Los Angeles Roleplay | Support Closed',
+        'Your DM support conversation has been closed.\n\n' +
+        'Thank you for contacting Los Angeles Roleplay.\n\n' +
+        'If you need further assistance, send another message to this bot to open a new conversation.',
+        'DM_SUPPORT_BANNER'
+      )
+    ).catch(() => {});
+  }
+
+  await sendLog(
+    'DM Support Closed',
+    `**Member:** <@${record.userId}>\n` +
+    `**Closed By:** <@${interaction.user.id}>\n` +
+    `**Channel:** <#${interaction.channelId}>`
+  );
+
+  delete db.dmSupport[interaction.channelId];
+  await save();
+
+  setTimeout(async () => {
+    await interaction.channel.delete(
+      'DM support conversation closed'
+    ).catch(console.warn);
+  }, 5000);
+}
+
+// =============================================
+// STAFF-ONLY USER INFORMATION
+// COMMAND: !?user info
+// =============================================
+
+async function handleUserInfoCommand(message) {
+  const match = message.content.trim().match(
+    /^!\?user\s+info(?:\s+(.+))?$/i
+  );
+
+  if (!match) return false;
+
+  if (!ENV.STAFF_ROLE_ID) {
+    await message.reply({
+      content: 'STAFF_ROLE_ID is not configured.',
+      allowedMentions: {
+        repliedUser: false,
+        parse: []
+      }
+    });
+
+    return true;
+  }
+
+  const staffMember = await fetchFreshMember(
+    message.guild,
+    message.author.id
+  );
+
+  // Exact configured staff role required.
+  if (!memberHasRole(staffMember, ENV.STAFF_ROLE_ID)) {
+    await message.reply({
+      content:
+        'You do not have permission to use this command.',
+      allowedMentions: {
+        repliedUser: false,
+        parse: []
+      }
+    });
+
+    return true;
+  }
+
+  const argument = match[1]?.trim();
+  let targetId = message.author.id;
+
+  if (argument) {
+    const mention = argument.match(
+      /^<@!?(\d{17,20})>$/
+    );
+
+    const numericId = argument.match(
+      /^(\d{17,20})$/
+    );
+
+    targetId = mention?.[1] || numericId?.[1];
+
+    if (!targetId) {
+      await message.reply({
+        content:
+          'Use !?user info @user, !?user info USER_ID, or !?user info.',
+        allowedMentions: {
+          repliedUser: false,
+          parse: []
+        }
+      });
+
+      return true;
+    }
+  }
+
+  const targetMember = await fetchFreshMember(
+    message.guild,
+    targetId
+  ).catch(() => null);
+
+  if (!targetMember) {
+    await message.reply({
+      content:
+        'That member could not be found in this server.',
+      allowedMentions: {
+        repliedUser: false,
+        parse: []
+      }
+    });
+
+    return true;
+  }
+
+  const user = targetMember.user;
+  const linked = db.linkedUsers[user.id];
+  const pending = db.pendingLinks[user.id];
+
+  const verified = isMelonlyVerified(targetMember);
+
+  const roleplaying = memberHasRole(
+    targetMember,
+    ENV.ROLEPLAYING_ROLE_ID
+  );
+
+  const inQueue = memberHasRole(
+    targetMember,
+    ENV.IN_QUEUE_ROLE_ID
+  );
+
+  let erlcStatus = 'Offline';
+
+  if (roleplaying && inQueue) {
+    erlcStatus = 'Roleplaying and In Queue';
+  } else if (roleplaying) {
+    erlcStatus = 'Roleplaying';
+  } else if (inQueue) {
+    erlcStatus = 'In Queue';
+  }
+
+  const linkStatusText = linked
+    ? 'Approved'
+    : pending
+      ? 'Pending Staff Approval'
+      : 'Not Linked';
+
+  const robloxAccount = linked || pending;
+
+  const robloxUsername = robloxAccount
+    ? escapeText(robloxAccount.robloxUsername)
+    : 'Not Linked';
+
+  const robloxId = robloxAccount
+    ? String(robloxAccount.robloxId)
+    : 'Not Linked';
+
+  const linkedAt = linked?.linkedAt
+    ? timestamp(linked.linkedAt)
+    : 'Not Available';
+
+  const approvedBy = linked?.approvedBy
+    ? `<@${linked.approvedBy}>`
+    : 'Not Available';
+
+  const joinedAt = targetMember.joinedTimestamp
+    ? timestamp(targetMember.joinedTimestamp)
+    : 'Unknown';
+
+  const createdAt = user.createdTimestamp
+    ? timestamp(user.createdTimestamp)
+    : 'Unknown';
+
+  const information =
+    '### Discord Information\n' +
+    `**User:** <@${user.id}>\n` +
+    `**Username:** ${escapeText(user.username)}\n` +
+    `**Display Name:** ${escapeText(targetMember.displayName)}\n` +
+    `**Discord ID:** ${user.id}\n` +
+    `**Account Created:** ${createdAt}\n` +
+    `**Joined Server:** ${joinedAt}\n\n` +
+
+    '### Roblox Information\n' +
+    `**Roblox Username:** ${robloxUsername}\n` +
+    `**Roblox User ID:** ${robloxId}\n` +
+    `**Link Status:** ${linkStatusText}\n` +
+    `**Linked At:** ${linkedAt}\n` +
+    `**Approved By:** ${approvedBy}\n\n` +
+
+    '### Verification Information\n' +
+    `**Melonly Verified:** ${verified ? 'Yes' : 'No'}\n\n` +
+
+    '### ER:LC Information\n' +
+    `**Current Status:** ${erlcStatus}\n` +
+    `**Roleplaying Role:** ${roleplaying ? 'Yes' : 'No'}\n` +
+    `**In Queue Role:** ${inQueue ? 'Yes' : 'No'}\n\n` +
+
+    '### Management Information\n' +
+    `**Information Requested By:** <@${message.author.id}>\n` +
+    `**Checked:** ${timestamp(Date.now())}`;
+
+  await message.channel.send(
+    createPanel(
+      'Los Angeles Roleplay | User Information',
+      information,
+      'USER_INFO_BANNER'
+    )
+  );
+
+  await sendLog(
+    'User Information Viewed',
+    `**Staff Member:** <@${message.author.id}>\n` +
+    `**Target Member:** <@${user.id}>\n` +
+    `**Channel:** <#${message.channelId}>`
+  );
+
+  return true;
+}
+
+// =============================================
+// SLASH COMMANDS
+// =============================================
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName('link-roblox')
+    .setDescription('Request to link your verified Roblox account')
+    .addStringOption(option =>
+      option
+        .setName('username')
+        .setDescription('Your Roblox username')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('link-status')
+    .setDescription('Check your Roblox account link status'),
+
+  new SlashCommandBuilder()
+    .setName('link-approve')
+    .setDescription('Approve a Roblox account link')
+    .addUserOption(option =>
+      option
+        .setName('user')
+        .setDescription('Member to approve')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('link-deny')
+    .setDescription('Deny a Roblox account link')
+    .addUserOption(option =>
+      option
+        .setName('user')
+        .setDescription('Member to deny')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('link-remove')
+    .setDescription('Remove an approved Roblox account link')
+    .addUserOption(option =>
+      option
+        .setName('user')
+        .setDescription('Member to unlink')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('ticket-panel')
+    .setDescription('Post the support ticket panel'),
+
+  new SlashCommandBuilder()
+    .setName('ticket-claim')
+    .setDescription('Claim the current ticket'),
+
+  new SlashCommandBuilder()
+    .setName('ticket-close')
+    .setDescription('Close the current ticket'),
+
+  new SlashCommandBuilder()
+    .setName('session-start')
+    .setDescription('Start a Los Angeles Roleplay session'),
+
+  new SlashCommandBuilder()
+    .setName('session-shutdown')
+    .setDescription('Shut down the current session'),
+
+  new SlashCommandBuilder()
+    .setName('session-vote')
+    .setDescription('Start a session vote'),
+
+  new SlashCommandBuilder()
+    .setName('session-status')
+    .setDescription('View the current session status'),
+
+  new SlashCommandBuilder()
+    .setName('session-info-setup')
+    .setDescription('Create or update the session information panel'),
+
+  new SlashCommandBuilder()
+    .setName('dm-support-claim')
+    .setDescription('Claim the current DM support conversation'),
+
+  new SlashCommandBuilder()
+    .setName('dm-support-close')
+    .setDescription('Close the current DM support conversation')
+];
+
+// =============================================
+// REGISTER SLASH COMMANDS
+// =============================================
+
+async function registerCommands() {
+  const rest = new REST({
+    version: '10'
+  }).setToken(ENV.DISCORD_TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(
+      ENV.CLIENT_ID,
+      ENV.GUILD_ID
+    ),
+    {
+      body: commands.map(command => command.toJSON())
+    }
+  );
+
+  console.log(
+    'Slash commands registered successfully.'
+  );
+}
+
+// =============================================
+// INTERACTION HANDLER
+// =============================================
+
+client.on(Events.InteractionCreate, async interaction => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      if (!interaction.inGuild()) return;
+
+      switch (interaction.commandName) {
+        case 'link-roblox':
+          return await requestRobloxLink(interaction);
+
+        case 'link-status':
+          return await linkStatus(interaction);
+
+        case 'link-approve':
+          return await approveRobloxLink(interaction);
+
+        case 'link-deny':
+          return await denyRobloxLink(interaction);
+
+        case 'link-remove':
+          return await unlinkRoblox(interaction);
+
+        case 'ticket-panel':
+          if (!await staffOnly(interaction)) return;
+
+          await interaction.channel.send(
+            ticketPanel()
+          );
+
+          return replyPrivate(
+            interaction,
+            'Ticket panel posted successfully.'
+          );
+
+        case 'ticket-claim':
+          return await claimTicket(interaction);
+
+        case 'ticket-close':
+          return await closeTicket(interaction);
+
+        case 'session-start':
+          return await startSession(interaction);
+
+        case 'session-shutdown':
+          return await shutdownSession(interaction);
+
+        case 'session-vote':
+          return await createSessionVote(interaction);
+
+        case 'session-status':
+          return replyPrivate(
+            interaction,
+            db.session.active
+              ? `A session is active. Host: <@${db.session.hostId}>.`
+              : 'There is currently no active session.'
+          );
+
+        case 'session-info-setup':
+          if (!await staffOnly(interaction)) return;
+
+          await interaction.deferReply({
+            flags: MessageFlags.Ephemeral
+          });
+
+          await updateSessionInfo();
+
+          return interaction.editReply(
+            'Session information panel updated.'
+          );
+
+        case 'dm-support-claim':
+          return await claimDMSupport(interaction);
+
+        case 'dm-support-close':
+          return await closeDMSupport(interaction);
+
+        default:
+          return;
+      }
+    }
+
+    if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'ticket_type') {
+        return await showTicketModal(interaction);
+      }
+    }
+
+    if (interaction.isModalSubmit()) {
+      if (
+        interaction.customId.startsWith('ticket_modal_')
+      ) {
+        return await submitTicketModal(interaction);
+      }
+    }
+
+    if (interaction.isButton()) {
+      if (
+        interaction.customId.startsWith('session_vote_')
+      ) {
+        return await castSessionVote(interaction);
+      }
+
+      switch (interaction.customId) {
+        case 'ticket_claim':
+          return await claimTicket(interaction);
+
+        case 'ticket_close':
+          return await closeTicket(interaction);
+
+        case 'dm_support_claim':
+          return await claimDMSupport(interaction);
+
+        case 'dm_support_close':
+          return await closeDMSupport(interaction);
+
+        case 'session_ping_button':
+          return await handleSessionPing(interaction);
+
+        default:
+          return;
+      }
+    }
+  } catch (error) {
+    console.error(
+      'Interaction error:',
+      error
+    );
+
+    if (
+      interaction.isRepliable() &&
+      interaction.deferred
+    ) {
+      await interaction.editReply({
+        content:
+          'An unexpected error occurred. Please try again later.'
+      }).catch(console.warn);
+    } else if (
+      interaction.isRepliable() &&
+      !interaction.replied
+    ) {
+      await replyPrivate(
+        interaction,
+        'An unexpected error occurred. Please try again later.'
+      ).catch(console.warn);
+    }
+  }
+});
+
+// =============================================
+// MESSAGE HANDLER
+// =============================================
+
+client.on(Events.MessageCreate, async message => {
+  try {
+    if (message.author.bot) return;
+
+    // Direct messages sent to the bot.
+    if (!message.guild) {
+      if (message.channel.type === ChannelType.DM) {
+        await handleIncomingDM(message);
+      }
+
+      return;
+    }
+
+    if (message.guild.id !== ENV.GUILD_ID) return;
+
+    // Staff messages in DM support channels.
+    if (findDMSupportByChannel(message.channelId)) {
+      await handleStaffDMReply(message);
+      return;
+    }
+
+    // Staff-only user information command.
+    const handledUserInfo = await handleUserInfoCommand(
+      message
+    );
+
+    if (handledUserInfo) return;
+
+    // Automated responses in regular tickets.
+    const ticket = db.tickets[message.channelId];
+
+    if (ticket) {
+      await automatedTicketReply(message, ticket);
+    }
+  } catch (error) {
+    console.error(
+      'Message handler error:',
+      error
+    );
+  }
+});
+
+// =============================================
+// ER:LC POLLING
+// =============================================
+
+let pollRunning = false;
+
+async function pollERLC() {
+  if (pollRunning || !ENV.ERLC_API_KEY) return;
+
+  pollRunning = true;
+
+  try {
+    const data = await getServerData();
+
+    await synchronizeRoles(data);
+
+    // Update live player count, staff count,
+    // queue count, and session information.
+    await updateSessionInfo(data);
+
+    await updateSessionAnnouncement(data);
+  } catch (error) {
+    console.warn(
+      'ER:LC polling error:',
+      errorMessage(error)
+    );
+  } finally {
+    pollRunning = false;
+  }
+}
+
+// =============================================
+// RENDER FREE HTTP SERVER
+// =============================================
+
+function startHTTPServer() {
+  const port = Number(ENV.PORT) || 10000;
+
+  const server = http.createServer((req, res) => {
+    if (
+      req.url === '/' ||
+      req.url === '/health'
+    ) {
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; charset=utf-8'
+      });
+
+      res.end(
+        client.isReady()
+          ? 'Los Angeles Roleplay bot is online.'
+          : 'Los Angeles Roleplay bot is starting.'
+      );
+
+      return;
+    }
+
+    res.writeHead(404, {
+      'Content-Type': 'text/plain; charset=utf-8'
+    });
+
+    res.end('Not Found');
+  });
+
+  server.listen(port, '0.0.0.0', () => {
+    console.log(
+      `HTTP server listening on port ${port}`
+    );
+  });
+}
+
+// =============================================
+// BOT READY
+// =============================================
+
+client.once(Events.ClientReady, async readyClient => {
+  console.log(
+    `Online as ${readyClient.user.tag}`
+  );
+
+  console.log(
+    'Los Angeles Roleplay Management is ready.'
+  );
+
+  await updateSessionInfo().catch(error => {
+    console.warn(
+      'Initial session information error:',
+      errorMessage(error)
+    );
+  });
+
+  if (ENV.ERLC_API_KEY) {
+    await pollERLC();
+
+    setInterval(() => {
+      pollERLC().catch(console.warn);
+    }, POLL_INTERVAL);
+  }
+});
+
+// =============================================
+// ERROR HANDLING
+// =============================================
+
+client.on(Events.Error, error => {
+  console.error(
+    'Discord client error:',
+    error
+  );
+});
+
+process.on('unhandledRejection', error => {
+  console.error(
+    'Unhandled promise rejection:',
+    error
+  );
+});
+
+process.on('uncaughtException', error => {
+  console.error(
+    'Uncaught exception:',
+    error
+  );
+});
+
+// =============================================
+// START BOT
+// =============================================
+
+async function main() {
+  await registerCommands();
+
+  startHTTPServer();
+
+  await client.login(
+    ENV.DISCORD_TOKEN
+  );
+}
+
+main().catch(error => {
+  console.error(
+    'Bot startup failed:',
+    error
+  );
+
+  process.exit(1);
+});
+
+
